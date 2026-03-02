@@ -22,6 +22,7 @@ most interesting scenario for testing the agent's dependency-graph reasoning.
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
@@ -50,7 +51,7 @@ class FaultScenario:
     @property
     def is_active(self) -> bool:
         """Return True if the fault is still ongoing."""
-        raise NotImplementedError
+        return self.resolved_at is None
 
 
 class FaultInjector:
@@ -76,7 +77,15 @@ class FaultInjector:
             log_generator:     Running LogGenerator instance to inject error logs into.
             metrics_generator: Running MetricsGenerator to apply fault profiles to.
         """
-        raise NotImplementedError
+        self._log_generator = log_generator
+        self._metrics_generator = metrics_generator
+        self._services: frozenset[str] = frozenset(
+            s["name"] for s in simulator_config["services"]
+        )
+        # _active: faults currently in effect — shrinks as faults expire or are cleared.
+        # _history: append-only log of every FaultScenario ever created.
+        self._active: list[FaultScenario] = []
+        self._history: list[FaultScenario] = []
 
     def inject(
         self,
@@ -99,7 +108,29 @@ class FaultInjector:
         Raises:
             ValueError: If service or fault_type is invalid.
         """
-        raise NotImplementedError
+        self._validate_fault(service, fault_type)
+
+        scenario = FaultScenario(
+            fault_id=str(uuid.uuid4()),
+            service=service,
+            fault_type=fault_type,
+            started_at=datetime.now(),
+            duration_seconds=duration_seconds,
+        )
+
+        # Both generators read service_states / active_baselines on every tick,
+        # so they must be updated together — split state would produce one tick
+        # where logs show a fault but metrics still look healthy (or vice versa),
+        # which would corrupt the training signal for the detection layer.
+        self._log_generator.service_states[service] = {
+            "healthy": False,
+            "fault_type": fault_type,
+        }
+        self._metrics_generator.apply_fault_profile(service, fault_type)
+
+        self._active.append(scenario)
+        self._history.append(scenario)
+        return scenario
 
     def clear(self, service: str, fault_type: str | None = None) -> None:
         """
@@ -110,11 +141,18 @@ class FaultInjector:
             fault_type: If provided, only clear faults of this type;
                         otherwise clear all faults on the service.
         """
-        raise NotImplementedError
+        to_resolve = [
+            s for s in self._active
+            if s.service == service
+            and (fault_type is None or s.fault_type == fault_type)
+        ]
+        for scenario in to_resolve:
+            self._resolve_fault(scenario)
 
     def clear_all(self) -> None:
         """Deactivate every active fault across all services."""
-        raise NotImplementedError
+        for scenario in list(self._active):  # copy — _resolve_fault mutates _active
+            self._resolve_fault(scenario)
 
     def tick(self) -> None:
         """
@@ -126,15 +164,23 @@ class FaultInjector:
 
         Called by the main pipeline loop on each simulation tick.
         """
-        raise NotImplementedError
+        now = datetime.now()
+        # Snapshot _active before iterating — _resolve_fault mutates the list.
+        expired = [
+            s for s in list(self._active)
+            if s.duration_seconds != -1
+            and (now - s.started_at).total_seconds() >= s.duration_seconds
+        ]
+        for scenario in expired:
+            self._resolve_fault(scenario)
 
     def active_faults(self) -> list[FaultScenario]:
         """Return a list of all currently active FaultScenario objects."""
-        raise NotImplementedError
+        return list(self._active)
 
     def fault_history(self) -> list[FaultScenario]:
         """Return the full ordered history of all faults (active + resolved)."""
-        raise NotImplementedError
+        return list(self._history)
 
     def _resolve_fault(self, scenario: FaultScenario) -> None:
         """
@@ -143,7 +189,19 @@ class FaultInjector:
         Args:
             scenario: The FaultScenario to resolve.
         """
-        raise NotImplementedError
+        scenario.resolved_at = datetime.now()
+        self._active = [s for s in self._active if s.fault_id != scenario.fault_id]
+
+        # Only restore healthy state if no other faults are still active on this service.
+        # Two simultaneous faults (e.g. latency_spike + memory_leak) should keep
+        # the service in fault mode until the last one is resolved.
+        remaining = [s for s in self._active if s.service == scenario.service]
+        if not remaining:
+            self._log_generator.service_states[scenario.service] = {
+                "healthy": True,
+                "fault_type": None,
+            }
+            self._metrics_generator.restore_baseline(scenario.service)
 
     def _validate_fault(self, service: str, fault_type: str) -> None:
         """
@@ -153,4 +211,11 @@ class FaultInjector:
             service:    Service name to validate.
             fault_type: Fault type to validate.
         """
-        raise NotImplementedError
+        if service not in self._services:
+            raise ValueError(
+                f"Unknown service {service!r}. Valid services: {sorted(self._services)}"
+            )
+        if fault_type not in FAULT_TYPES:
+            raise ValueError(
+                f"Unknown fault type {fault_type!r}. Valid types: {sorted(FAULT_TYPES)}"
+            )

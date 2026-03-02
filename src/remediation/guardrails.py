@@ -1,173 +1,163 @@
 """
-Safety guardrails for automated remediation actions.
+Structured log generator for simulated FCT microservices.
 
-Prevents the ReAct agent from taking actions that could make a situation
-worse, create restart loops, or overwhelm already-degraded services.
+Generates realistic, structured log entries for each service defined in
+config.yaml. Each log entry contains: timestamp, level, service, message.
 
-Guardrail rules (configurable via config.yaml → remediation):
+Log levels and their approximate emission rates during normal operation:
+  - INFO:     80%
+  - WARNING:  15%
+  - ERROR:     5%
 
-  1. Max restarts per service (default: 3):
-       If a service has been restarted max_restarts_per_service times within
-       the current incident window, further restart actions are blocked and
-       an escalation is triggered instead.
+Services simulated:
+  - transaction-validator  (upstream orchestrator)
+  - fraud-check-service    (depends on title-search-service)
+  - document-processor     (depends on title-search-service)
+  - title-search-service   (leaf dependency, no upstream deps)
 
-  2. Restart cooldown (default: 300 s):
-       A minimum interval must elapse between consecutive restarts of the same
-       service. Prevents rapid restart loops that could worsen cascade failures.
+The generator checks a shared service_states dict each tick to determine
+whether to emit healthy or fault-mode logs, including cascade errors for
+services whose dependencies are faulted.
 
-  3. Auto-escalate after N consecutive failures (default: 2):
-       If the same remediation action has been attempted N times without the
-       anomaly score improving, block further attempts and raise an alert.
-
-  4. Action schema validation:
-       Every action must pass Pydantic validation (handled by ActionPlanner)
-       before reaching the guardrail layer. The guardrail layer performs
-       additional semantic checks (e.g., cannot scale a crashed service).
-
-  5. Dry-run mode:
-       When dry_run=True, all actions are allowed but not executed; the
-       guardrail simply logs what would have been blocked.
-
-All decisions are recorded in a GuardrailLog for audit and dashboard display.
+# ──────────────────────────────────────────────────────────────
+# REMOVED FOR MVP (add back if time permits / mention in ASSUMPTIONS.md):
+#
+# - trace_id (UUID4 per request):
+#     Enables correlating a single request across all four services.
+#     Detection layer works on aggregate counts, not individual traces,
+#     so not needed for the demo. Would be valuable for distributed
+#     tracing visualization in a production system.
+#
+# - metadata dict on LogEntry:
+#     Extra structured fields (e.g. latency_ms, property_id, risk_score)
+#     attached to each log. Useful for richer analysis but the anomaly
+#     detector only needs timestamp, service, level, and message text.
+#
+# - DEBUG and CRITICAL log levels:
+#     Three levels (INFO, WARN, ERROR) are sufficient to demonstrate
+#     anomaly detection. A production system would use all five.
+#
+# - JSON serialization (to_dict / to_json):
+#     The MVP passes LogEntry objects directly between modules in memory.
+#     In production you'd serialize to JSON for log shipping (e.g. to
+#     Elasticsearch or CloudWatch).
+#
+# - Generator/yield pattern:
+#     Replaced with a simpler generate_tick() that returns a list.
+#     A real system would use async generators or a message queue.
+# ──────────────────────────────────────────────────────────────
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from src.agent.action_planner import Action, RestartAction
-
 
 @dataclass
-class GuardrailDecision:
+class LogEntry:
+    """A single structured log record emitted by a simulated service."""
+
+    timestamp: datetime
+    level: str          # INFO | WARNING | ERROR
+    service: str        # e.g. "transaction-validator"
+    message: str        # Human-readable log message
+
+
+class LogGenerator:
     """
-    The outcome of a guardrail check for a single action.
+    Produces a batch of log entries for all services on each tick.
 
-    Attributes:
-        action:    The action that was checked.
-        allowed:   True if the action is permitted to proceed.
-        reason:    Human-readable explanation (especially useful when blocked).
-        checked_at: Timestamp of the check.
-    """
-
-    action: Action
-    allowed: bool
-    reason: str
-    checked_at: datetime = field(default_factory=datetime.utcnow)
-
-
-class GuardrailViolation(Exception):
-    """Raised when an action is blocked by a guardrail rule."""
-
-
-class Guardrails:
-    """
-    Enforces safety constraints on remediation actions before execution.
-
-    The Executor calls `check()` before executing any action. If the check
-    returns a GuardrailDecision with allowed=False, the Executor creates a
-    blocked ExecutionResult and does not call the action handler.
+    Checks the shared service_states dict to determine healthy vs fault
+    output. Also checks the dependency graph so that when a downstream
+    service is faulted, upstream services emit cascade error messages.
     """
 
-    def __init__(
-        self,
-        remediation_config: dict[str, Any],
-        dry_run: bool = False,
-    ) -> None:
+    def __init__(self, simulator_config: dict[str, Any], service_states: dict) -> None:
         """
-        Initialise the guardrails from the [remediation] section of config.yaml.
-
         Args:
-            remediation_config: Must contain max_restarts_per_service,
-                                restart_cooldown_seconds, and
-                                auto_escalate_after_failures.
-            dry_run:            If True, all checks pass but decisions are logged.
+            simulator_config: The 'simulator' section from config.yaml
+                              containing 'services' list with names and dependencies.
+            service_states:   Shared mutable dict tracking each service's health.
+                              Format: {"service-name": {"healthy": True, "fault_type": None}}
         """
         raise NotImplementedError
 
-    def check(self, action: Action) -> GuardrailDecision:
+    def generate_tick(self) -> list[LogEntry]:
         """
-        Evaluate all applicable guardrail rules for the given action.
+        Produce one batch of log entries (one or more per service).
 
-        Dispatches to the appropriate rule method(s) based on action type,
-        then returns a combined decision.
-
-        Args:
-            action: The Action to evaluate (RestartAction, ScaleAction, etc.).
+        For each service:
+          1. Check if the service itself is faulted → use fault templates
+          2. Check if any dependency is faulted → mix in cascade templates
+          3. Otherwise → use healthy templates with normal level weights
 
         Returns:
-            GuardrailDecision with allowed flag and human-readable reason.
+            List of LogEntry objects for this tick.
         """
         raise NotImplementedError
 
-    def record_execution(self, action: Action, success: bool) -> None:
+    def _select_log_level(self, fault_active: bool) -> str:
         """
-        Update internal state after an action is executed.
+        Pick a log level using weighted random selection.
 
-        Called by the Executor after execution so guardrails can track
-        cumulative restart counts, last restart timestamps, and failure streaks.
+        Normal weights:  INFO 80%, WARNING 15%, ERROR 5%
+        Fault weights:   INFO 10%, WARNING 20%, ERROR 70%
 
         Args:
-            action:  The action that was executed.
-            success: Whether the action achieved the desired effect.
-        """
-        raise NotImplementedError
-
-    def reset_service(self, service: str) -> None:
-        """
-        Reset all guardrail counters and timestamps for a specific service.
-
-        Called after a successful incident resolution so the service starts
-        fresh in the next incident window.
-
-        Args:
-            service: Service name to reset.
-        """
-        raise NotImplementedError
-
-    def reset_all(self) -> None:
-        """Reset guardrail state for all services."""
-        raise NotImplementedError
-
-    def decision_log(self) -> list[GuardrailDecision]:
-        """Return the full ordered log of all guardrail decisions."""
-        raise NotImplementedError
-
-    def _check_restart_limit(self, action: RestartAction) -> GuardrailDecision:
-        """
-        Enforce max_restarts_per_service for a RestartAction.
-
-        Args:
-            action: The RestartAction to check.
+            fault_active: Whether this service or its dependencies are faulted.
 
         Returns:
-            GuardrailDecision allowing or blocking the restart.
+            One of "INFO", "WARNING", "ERROR"
         """
         raise NotImplementedError
 
-    def _check_restart_cooldown(self, action: RestartAction) -> GuardrailDecision:
+    def _pick_template(self, service: str, level: str, fault_type: str | None) -> str:
         """
-        Enforce restart_cooldown_seconds between consecutive restarts.
+        Select a random message template for the given service, level, and state.
+
+        Templates are defined per service, per state (healthy / fault_type),
+        per level. Placeholders like {tx_id}, {pid}, {latency} are filled
+        with random values by _fill_template().
 
         Args:
-            action: The RestartAction to check.
+            service:    Service name.
+            level:      Log level.
+            fault_type: Active fault type, or None for healthy operation.
 
         Returns:
-            GuardrailDecision allowing or blocking the restart.
+            A message template string with placeholders.
         """
         raise NotImplementedError
 
-    def _check_failure_streak(self, action: Action) -> GuardrailDecision:
+    def _fill_template(self, template: str) -> str:
         """
-        Block actions on a service that has failed auto_escalate_after_failures
-        times in a row without improvement.
+        Replace placeholders in a template with random realistic values.
+
+        Handles: {tx_id}, {pid}, {latency}, {duration}, {score}, {n}, {count}
+        Unused placeholders in a given template are harmless — .format()
+        only replaces what's present if you use .format_map() with a defaultdict.
 
         Args:
-            action: The action to check.
+            template: Message string with {placeholder} tokens.
 
         Returns:
-            GuardrailDecision allowing or blocking the action.
+            Filled message string.
+        """
+        raise NotImplementedError
+
+    def _get_faulted_dependencies(self, service: str) -> list[str]:
+        """
+        Check if any of this service's dependencies are currently faulted.
+
+        Uses the dependency graph from config.yaml.
+
+        Args:
+            service: The service to check dependencies for.
+
+        Returns:
+            List of dependency service names that are currently faulted.
+            Empty list if all dependencies are healthy.
         """
         raise NotImplementedError
