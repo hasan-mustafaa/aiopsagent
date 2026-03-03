@@ -1,12 +1,7 @@
-"""Z-score based anomaly detection on per-service metric time series.
+"""Z-score anomaly detection on metric time series.
 
-Maintains rolling windows of each monitored metric per service and flags
-anomalies when any metric's z-score exceeds the configured threshold.
-Designed as the lightweight, low-latency component of the detection ensemble
-— produces signals immediately without needing training data.
-
-Anomaly score is normalized to [0, 1] via sigmoid scaling so it can be
-combined with the ML detector output in the ensemble.
+Fast, unsupervised detection via rolling windows. Combines with ML detector
+for ensemble scoring.
 """
 
 from __future__ import annotations

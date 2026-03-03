@@ -1,22 +1,8 @@
-"""
-Time-series metrics generator for simulated FCT microservices.
+"""Time-series metrics generator for FCT services.
 
-Produces realistic operational metrics for each service on a configurable
-interval (default: every 5 seconds). Metrics are modelled as Gaussian random
-walks around service-specific baselines so the anomaly detectors see plausible
-"normal" variance before fault injection.
-
-Metrics produced per service:
-  - cpu_percent       : CPU utilisation (0–100)
-  - memory_mb         : Resident memory in megabytes
-  - latency_ms        : P99 request latency in milliseconds
-  - error_rate        : Errors per second (float)
-  - request_rate      : Requests per second (float)
-  - active_connections: Current open connections (int)
-
-The FaultInjector calls `apply_fault_profile()` to shift baselines and variance
-during an active fault, creating the anomalous signal that the detection layer
-is expected to catch.
+Produces realistic metrics (cpu, memory, latency, errors, requests, connections)
+modelled as Gaussian random walks. FaultInjector calls apply_fault_profile() to
+shift baselines during active faults.
 """
 
 from __future__ import annotations
@@ -28,14 +14,8 @@ from datetime import datetime
 from typing import Any, Generator
 
 
-# ── Fault multipliers ─────────────────────────────────────────────────────────
-# Applied against each service's *default* baseline, not its current active one.
-# Multipliers (rather than absolute values) keep anomaly magnitude proportional
-# to each service's operating range — a latency_spike on title-search-service
-# (baseline 15 ms) and on document-processor (200 ms) both produce the same
-# relative deviation, giving the detector a consistent signal-to-noise ratio.
-#
-# cpu_percent is additionally clamped to [0, 100] in generate().
+# Fault multipliers applied to default baselines (not current values)
+# to maintain proportional anomaly magnitude across services.
 
 _FAULT_MULTIPLIERS: dict[str, dict[str, float]] = {
     "crash": {

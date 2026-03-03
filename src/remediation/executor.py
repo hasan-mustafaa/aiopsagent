@@ -1,15 +1,11 @@
-"""Remediation executor for the simulated FCT microservice mesh.
+"""Remediation executor for the simulated service mesh.
 
-Translates validated Action objects into operations against the simulator.
-All actions manipulate in-memory simulator state (no real Kubernetes/Docker):
-
-  restart_service  — clears active faults, restores metrics baseline
-  scale_service    — records replica count change (no physical resources to scale)
-  rollback_service — clears faults, restores metrics baseline (same as restart)
-  alert_on_call    — logs the alert; does not call a real paging system
-  no_action        — no-op; records the decision in the execution log
-
-Every execution returns an ExecutionResult used by ReActAgent as its next Observation.
+Translates actions into simulator operations. All actions work on in-memory state:
+- restart_service: clears faults, restores baseline
+- scale_service: records replica change
+- rollback_service: clears faults
+- alert_on_call: logs alert
+- no_action: no-op decision
 """
 
 from __future__ import annotations

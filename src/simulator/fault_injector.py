@@ -1,23 +1,7 @@
-"""
-Fault injector for the simulated FCT microservice mesh.
+"""Fault injector for simulated services.
 
-Periodically introduces realistic fault scenarios into the running simulation
-so the detection and remediation layers have real anomalies to respond to.
-
-Supported fault types:
-  - crash              : Service stops responding; metrics drop to zero, logs go silent
-                         then emit CRITICAL restart messages.
-  - latency_spike      : P99 latency multiplies by 5–20x for a configurable duration.
-  - connection_failure : Active connections drop suddenly; ERROR logs emit
-                         "connection refused / timeout" messages.
-  - memory_leak        : Memory grows monotonically over time until OOM or remediation.
-  - oom                : Sudden memory exhaustion; service emits OOM CRITICAL log and
-                         restarts.
-
-Faults can target any of the four FCT services. Injecting into
-title-search-service (the shared leaf dependency) will naturally cascade
-upstream through fraud-check-service and document-processor, which is the
-most interesting scenario for testing the agent's dependency-graph reasoning.
+Supports: crash, latency_spike, connection_failure, memory_leak, oom.
+Faults cascade upstream through the dependency graph.
 """
 
 from __future__ import annotations

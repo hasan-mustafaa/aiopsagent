@@ -1,11 +1,6 @@
-"""Online log clustering via the Drain algorithm.
+"""Online log parsing via the Drain algorithm.
 
-Parses raw log messages into generalized templates with variable wildcards.
-For example: "Connection to 10.0.0.1 timed out" → "Connection to <*> timed out".
-
-Each service maintains its own Drain instance to prevent cross-service template
-pollution. Cluster IDs are mapped globally to support downstream feature extraction
-and anomaly detection.
+Clusters raw logs into templates. Extracts features for anomaly detection.
 """
 
 from __future__ import annotations

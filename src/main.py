@@ -1,15 +1,7 @@
-"""Entry point for the LogSentry Agent pipeline.
+"""LogSentry Agent pipeline orchestrator.
 
-Orchestrates the full system lifecycle:
-  1. Load configuration from config/config.yaml.
-  2. Start the simulator (metrics generator + fault injector).
-  3. Warm up the detection pipeline (fill stat windows, train ML models).
-  4. Run the main loop: detect anomalies → invoke ReAct agent → remediate.
-
-Run with:
-    python -m src.main
-    python -m src.main --dry-run
-    python -m src.main --config path/to/config.yaml
+Loads config, runs warm-up (train ML models), then enters the main detection loop:
+anomalies → ReAct agent reasoning → automated remediation.
 """
 
 from __future__ import annotations
@@ -62,17 +54,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_config(config_path: Path = Path("config/config.yaml")) -> dict:
-    """Load configuration from YAML file.
-
-    Args:
-        config_path: Path to the YAML configuration file.
-
-    Returns:
-        Configuration dictionary.
-
-    Raises:
-        FileNotFoundError: If the config file doesn't exist.
-    """
+    """Load YAML config file."""
     with open(config_path) as f:
         return yaml.safe_load(f)
 
@@ -193,13 +175,11 @@ class Pipeline:
         training_data: dict[str, list[np.ndarray]] = {s: [] for s in self._services}
 
         for _ in range(target):
-            # One round = one snapshot per service
             for _ in range(len(self._services)):
                 snapshot = next(self._metrics_iter)
                 self._stat_detector.update(snapshot)
                 self._feature_extractor.ingest_metric(snapshot)
 
-            # Extract feature vectors after each round
             for service in self._services:
                 fv = self._feature_extractor.extract(service)
                 if fv is not None:
@@ -222,7 +202,6 @@ class Pipeline:
         # Advance fault injector (expires timed-out faults)
         self._fault_injector.tick()
 
-        # Generate logs for this tick and feed into dashboard buffer
         log_entries = self._log_gen.generate_tick()
         for entry in log_entries:
             self._dash["log_buffer"].append({
@@ -231,35 +210,27 @@ class Pipeline:
                 "level":     entry.level,
                 "message":   entry.message,
             })
-        # Cap the log buffer
         if len(self._dash["log_buffer"]) > _MAX_LOG_BUFFER:
             self._dash["log_buffer"] = self._dash["log_buffer"][-_MAX_LOG_BUFFER:]
 
-        # Generate one snapshot per service
         for _ in range(len(self._services)):
             snapshot = next(self._metrics_iter)
             service = snapshot.service
 
-            # Statistical detection
             stat_result = self._stat_detector.update(snapshot)
 
-            # Feature extraction
             self._feature_extractor.ingest_metric(snapshot)
             fv = self._feature_extractor.extract(service)
 
-            # ML detection (if model trained)
             ml_score = 0.0
             if fv is not None and self._ml_detector.is_trained(service):
                 ml_result = self._ml_detector.detect(fv)
                 ml_score = ml_result.anomaly_score
 
-            # Ensemble score
             ensemble_score, is_anomaly = self._feature_extractor.compute_ensemble_score(
                 stat_score=stat_result.anomaly_score,
                 ml_score=ml_score,
             )
-
-            # Update dashboard metric history (cap at 500 points per service)
             history = self._dash["metric_history"][service]
             history.append(snapshot.to_dict())
             if len(history) > 500:
@@ -280,7 +251,6 @@ class Pipeline:
                     service, ensemble_score, stat_result, fv, snapshot,
                 )
 
-        # Update service status based on active faults
         active_faults = {s.service: s.fault_type for s in self._fault_injector.active_faults()}
         for svc in self._services:
             if svc not in active_faults:
@@ -290,7 +260,6 @@ class Pipeline:
             else:
                 self._dash["service_status"][svc] = "degraded"
 
-        # Sync remediation log from executor and persist state to disk
         self._dash["remediation_log"] = [
             r.to_dict() for r in self._executor.execution_log()
         ]
@@ -334,7 +303,6 @@ class Pipeline:
                 result.rca_report.get("confidence", 0.0),
             )
 
-        # Append serialized agent result for the dashboard
         self._dash["agent_results"].append({
             "context": {
                 "service":          context.service,
@@ -359,7 +327,7 @@ class Pipeline:
 
 
     def _save_dashboard_state(self) -> None:
-        """Write dashboard data to _STATE_FILE so the Streamlit process can read it."""
+        """Persist dashboard state to JSON file."""
         _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         tmp = _STATE_FILE.with_suffix(".tmp")
         try:
@@ -372,21 +340,13 @@ class Pipeline:
 
 
 def build_pipeline(config: dict, dry_run: bool = False) -> Pipeline:
-    """Instantiate and wire all pipeline components from config.
-
-    Args:
-        config:  Loaded configuration dictionary.
-        dry_run: If True, executor logs actions without applying them.
-
-    Returns:
-        A fully wired Pipeline ready to run.
-    """
+    """Build fully wired pipeline."""
     return Pipeline(config, dry_run=dry_run)
 
 
 def main(config_path: Optional[Path] = None) -> None:
-    """Main entry point. Parses args, loads config, builds and runs the pipeline."""
-    load_dotenv()  # Load .env file for OPENAI_API_KEY and other env vars
+    """Main entry point."""
+    load_dotenv()
 
     logging.basicConfig(
         level=logging.INFO,

@@ -39,9 +39,9 @@ _METRIC_LABELS: dict[str, str] = {
     "request_rate": "Request Rate (req/s)",
 }
 _LEVEL_BG: dict[str, str] = {
-    "CRITICAL": "#ff4444",
-    "ERROR":    "#ffcccc",
-    "WARNING":  "#fff3cd",
+    "CRITICAL": "#c0392b",
+    "ERROR":    "#e74c3c",
+    "WARNING":  "#e67e22",
 }
 
 
@@ -362,7 +362,7 @@ def render_log_stream(state: DashboardState) -> None:
     def _color_rows(row: pd.Series) -> list[str]:
         level = row.get("level", "INFO") if "level" in row.index else "INFO"
         bg = _LEVEL_BG.get(str(level), "")
-        style = f"background-color: {bg}" if bg else ""
+        style = f"background-color: {bg}; color: #ffffff" if bg else ""
         return [style] * len(row)
 
     styled = df.style.apply(_color_rows, axis=1)

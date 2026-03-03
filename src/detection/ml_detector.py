@@ -1,12 +1,7 @@
-"""Isolation Forest anomaly detection on multivariate feature vectors.
+"""Isolation Forest detector for multivariate anomalies.
 
-Trains per-service Isolation Forest models on normal operational data, then
-scores new feature vectors to detect multivariate anomalies. Raw IF scores
-(negative = anomalous) are normalized to [0, 1] for ensemble fusion with the
-statistical detector.
-
-Returns neutral scores during warm-up (before training) so the ensemble
-degrades gracefully rather than producing false positives.
+Per-service unsupervised training on warm-up data. Normalizes scores for
+ensemble combination with statistical detector.
 """
 
 from __future__ import annotations

@@ -1,13 +1,7 @@
-"""Sliding-window feature extraction for anomaly detection.
+"""Feature extraction and ensemble scoring for anomaly detection.
 
-Aggregates ParsedLog and MetricSnapshot streams into fixed-size numerical
-feature vectors (one per service per window). These vectors feed both the
-StatisticalDetector and MLAnomalyDetector. Also handles ensemble score
-fusion from the two detector outputs.
-
-Feature vector layout (15 dimensions):
-  [0-5]   Log-derived:  counts, error rate, template diversity
-  [6-14]  Metric-derived: CPU, memory, latency, error rate, throughput stats
+Builds fixed-size feature vectors from logs and metrics. Fuses statistical
+and ML detector outputs for final anomaly verdict.
 """
 
 from __future__ import annotations
