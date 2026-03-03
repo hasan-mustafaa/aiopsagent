@@ -6,12 +6,9 @@
 
 ## Overview
 
-<!-- TODO: Fill in after MVP is complete -->
-<!-- Describe what the system does end-to-end, the problem it solves, and why it matters. -->
-
 LogSentry Agent is a self-healing observability pipeline built for simulated FCT (Financial Crime & Technology) microservices. It combines traditional statistical methods with modern ML and LLM-powered reasoning to detect, diagnose, and remediate operational incidents — all without human intervention.
 
-**Core capabilities (to be implemented):**
+**Core capabilities:**
 - Real-time structured log generation across 4 interdependent microservices
 - Fault injection (crashes, latency spikes, memory leaks, connection failures)
 - Hybrid anomaly detection (Z-score + Isolation Forest ensemble)
@@ -23,44 +20,44 @@ LogSentry Agent is a self-healing observability pipeline built for simulated FCT
 
 ## Architecture
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the full system design.
+Full system design: [ARCHITECTURE.md](ARCHITECTURE.md)
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        LogSentry Agent                          │
-│                                                                 │
-│  [Simulator] → [Detection] → [ReAct Agent] → [Remediation]    │
-│       ↓              ↓             ↓               ↓           │
-│  [Dashboard ─────────────────────────────────────────────────] │
-└─────────────────────────────────────────────────────────────────┘
-```
+![LogSentry Architecture](docs/architecture.png)
 
-<!-- TODO: Replace with full ASCII architecture diagram after implementation -->
+The pipeline has five stages:
 
----
-
-## AI Techniques Used
-
-See [AI_TECHNIQUES.md](AI_TECHNIQUES.md) for detailed explanations.
-
-| Technique | Purpose |
-|---|---|
-| **Isolation Forest** | ML-based anomaly detection on feature vectors |
-| **Z-Score / Moving Average** | Statistical baseline anomaly detection |
-| **Ensemble Scoring** | Combines statistical + ML signals with tunable weights |
-| **Drain Algorithm** | Structured log template mining from raw log lines |
-| **ReAct Agent Pattern** | Observe → Think → Act LLM reasoning loop |
-| **LLM Root Cause Analysis** | GPT-4o-mini / Claude reasons over service dependency graph |
+| Stage | Component | Description |
+|-------|-----------|-------------|
+| 1 | **Simulator** | Generates metrics + logs for 4 FCT services; injects faults |
+| 2 | **Detection** | Z-score + Isolation Forest ensemble; scores anomalies 0-1 |
+| 3 | **Agent** | ReAct LLM loop (Observe → Think → Act → RCA report) |
+| 4 | **Remediation** | Executes actions against simulator with safety guardrails |
+| 5 | **Dashboard** | Live Streamlit UI reading from shared JSON state file |
 
 ---
 
-## Getting Started
+## AI Techniques
+
+Full explanation: [AI_TECHNIQUES.md](AI_TECHNIQUES.md)
+
+| Technique | File | Purpose |
+|-----------|------|---------|
+| **Drain Algorithm** | `src/detection/log_parser.py` | Mines structured templates from raw log lines |
+| **Z-Score Detection** | `src/detection/statistical_detector.py` | Per-metric rolling baseline anomaly detection |
+| **Isolation Forest** | `src/detection/ml_detector.py` | Multivariate ML anomaly detection per service |
+| **Ensemble Scoring** | `src/detection/feature_extractor.py` | `0.4 x stat + 0.6 x ML`, triggers at score >= 0.5 |
+| **ReAct Agent** | `src/agent/react_agent.py` | Observe → Think → Act LLM reasoning loop |
+| **LLM RCA** | `src/agent/prompts.py` | Structured root cause report with confidence score |
+| **Safety Guardrails** | `src/remediation/guardrails.py` | Restart limits, cooldown, auto-escalation |
+
+---
+
+## Setup Instructions
 
 ### Prerequisites
 
 - Python 3.11+
 - An OpenAI API key (or Anthropic API key)
-- `pip` or `uv` for dependency management
 
 ### Installation
 
@@ -78,26 +75,66 @@ pip install -r requirements.txt
 
 # 4. Configure environment
 cp .env.example .env
-# Edit .env and add your OPENAI_API_KEY
+# Edit .env and set OPENAI_API_KEY=sk-...
 ```
 
-### Running the Agent
+### Configuration
+
+All tuneable parameters are in `config/config.yaml`:
+
+```yaml
+simulator:
+  metrics_interval_seconds: 5   # tick rate
+
+detection:
+  z_score_threshold: 3.0        # statistical sensitivity
+  ensemble_weights:
+    statistical: 0.4
+    ml: 0.6
+
+agent:
+  llm_provider: "openai"        # or "anthropic"
+  model: "gpt-4o-mini"
+  max_reasoning_steps: 5
+
+remediation:
+  max_restarts_per_service: 3
+  restart_cooldown_seconds: 300
+```
+
+### Running the Pipeline
 
 ```bash
-# Run the full pipeline (simulator + detection + agent + remediation)
+# Start the detection + agent + remediation pipeline
 python -m src.main
 
-# Or use the quick demo script
-python scripts/run_demo.py
+# Dry-run mode (logs actions without executing them)
+python -m src.main --dry-run
 ```
 
 ### Running the Dashboard
+
+In a separate terminal:
 
 ```bash
 streamlit run src/dashboard/app.py
 ```
 
-Open [http://localhost:8501](http://localhost:8501) in your browser.
+Open [http://localhost:8501](http://localhost:8501) in your browser. The dashboard auto-refreshes every 2 seconds.
+
+---
+
+## How It Works
+
+1. The **Simulator** generates structured JSON logs and time-series metrics for 4 FCT microservices every 5 seconds.
+2. The **FaultInjector** injects realistic faults (crashes, latency spikes, memory leaks, connection failures) that cascade upstream through the dependency graph.
+3. The **LogParser** (Drain algorithm) extracts log templates and computes error rate features.
+4. The **FeatureExtractor** builds time-windowed multivariate feature vectors from metric snapshots.
+5. The **Ensemble Detector** (Z-score + Isolation Forest) scores each window and triggers on score >= 0.5.
+6. On anomaly detection, the **ReAct Agent** is invoked with the full anomaly context including triggered metrics and recent logs.
+7. The Agent iterates Observe → Think → Act (up to 5 steps), reasoning over the service dependency graph to identify root cause.
+8. The **Executor** applies the chosen action (restart, scale, rollback, alert) with guardrail safety checks before execution.
+9. The **Dashboard** reflects all state changes in real time via a shared JSON state file written after every tick.
 
 ---
 
@@ -105,41 +142,41 @@ Open [http://localhost:8501](http://localhost:8501) in your browser.
 
 ```
 aiopsagent/
-├── config/config.yaml          # Single source of truth for all config
+├── config/
+│   └── config.yaml             # Single source of truth for all parameters
 ├── src/
 │   ├── main.py                 # Pipeline orchestrator
-│   ├── simulator/              # Log & metrics generation, fault injection
-│   ├── detection/              # Log parsing, feature extraction, anomaly detection
-│   ├── agent/                  # ReAct LLM agent, prompts, action planner
-│   ├── remediation/            # Action executor + safety guardrails
-│   └── dashboard/              # Streamlit live dashboard
+│   ├── simulator/
+│   │   ├── metrics_generator.py    # Gaussian random-walk metric streams
+│   │   ├── log_generator.py        # Structured log entry generation
+│   │   └── fault_injector.py       # Fault scenario injection
+│   ├── detection/
+│   │   ├── log_parser.py           # Drain log template mining
+│   │   ├── feature_extractor.py    # Feature vectors + ensemble scoring
+│   │   ├── statistical_detector.py # Z-score rolling window detection
+│   │   └── ml_detector.py          # Isolation Forest per-service model
+│   ├── agent/
+│   │   ├── react_agent.py          # ReAct Observe → Think → Act loop
+│   │   ├── prompts.py              # LLM prompt construction
+│   │   └── action_planner.py       # JSON action parsing + Pydantic models
+│   ├── remediation/
+│   │   ├── executor.py             # Action dispatch + simulator integration
+│   │   └── guardrails.py           # Safety limits on automated actions
+│   └── dashboard/
+│       └── app.py                  # Streamlit live dashboard
 ├── tests/                      # Unit tests per component
-├── scripts/run_demo.py         # End-to-end demo
-└── data/sample_logs/           # Persisted sample log files
+├── docs/
+│   └── architecture.png        # System architecture diagram
+├── ARCHITECTURE.md             # Full system design
+├── AI_TECHNIQUES.md            # AI/ML technique explanations
+├── ASSUMPTIONS.md              # Assumptions and future improvements
+└── .env.example                # Environment variable template
 ```
-
----
-
-## How It Works
-
-<!-- TODO: Fill in after implementation with a numbered end-to-end flow description -->
-<!-- Example:
-1. The Simulator generates structured JSON logs and time-series metrics for 4 FCT microservices.
-2. The FaultInjector periodically injects realistic faults into the service mesh.
-3. The LogParser (Drain algorithm) extracts log templates from raw log streams.
-4. The FeatureExtractor builds time-windowed feature vectors.
-5. The Ensemble Detector (Z-score + Isolation Forest) scores each window.
-6. On anomaly detection, the ReAct Agent is invoked with the anomaly context.
-7. The Agent reasons over service dependencies and selects a remediation action.
-8. The Executor applies the action (restart, scale, rollback) with guardrail checks.
-9. The Dashboard reflects all state changes in real time.
--->
 
 ---
 
 ## Demo Video
 
-<!-- TODO: Add demo video link after recording -->
 > Demo video link: _coming soon_
 
 ---
@@ -148,20 +185,30 @@ aiopsagent/
 
 See [ASSUMPTIONS.md](ASSUMPTIONS.md) for a full list of assumptions, known limitations, and planned improvements.
 
+**Key assumptions:**
+- All microservices are simulated in-process (no real containers or network)
+- Isolation Forest is trained once during warm-up and not retrained
+- Single LLM provider per run (no fallback)
+
+**Planned improvements:**
+- Online model retraining for concept drift
+- Kubernetes and PagerDuty integration for real remediation
+- Multi-agent parallelism for concurrent incident handling
+- Persistent incident memory across agent runs
+
 ---
 
 ## Tech Stack
 
 | Layer | Technology |
-|---|---|
-| Language | Python 3.11 |
+|-------|------------|
+| Language | Python 3.11+ |
 | ML / Detection | scikit-learn, numpy, scipy, pandas |
 | Log Parsing | drain3 |
-| LLM | OpenAI GPT-4o-mini (or Anthropic Claude) |
+| LLM | OpenAI GPT-4o-mini or Anthropic Claude |
 | Dashboard | Streamlit + Plotly |
 | Config | PyYAML + Pydantic |
-| Testing | pytest + pytest-asyncio |
-| Terminal UI | Rich |
+| Testing | pytest |
 
 ---
 

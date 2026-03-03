@@ -37,6 +37,7 @@ from src.detection.statistical_detector import StatisticalDetector
 from src.remediation.executor import Executor
 from src.remediation.guardrails import Guardrails
 from src.simulator.fault_injector import FaultInjector
+from src.simulator.log_generator import LogGenerator
 from src.simulator.metrics_generator import MetricsGenerator
 
 logger = logging.getLogger(__name__)
@@ -76,19 +77,7 @@ def load_config(config_path: Path = Path("config/config.yaml")) -> dict:
         return yaml.safe_load(f)
 
 
-# ── Simulator shim ────────────────────────────────────────────────────────────
-
-class _LogGeneratorShim:
-    """Minimal stand-in until LogGenerator is fully implemented.
-
-    FaultInjector reads/writes service_states on this object, so we need
-    at least that attribute present.
-    """
-
-    def __init__(self, services: list[str]) -> None:
-        self.service_states: dict[str, dict[str, Any]] = {
-            s: {"healthy": True, "fault_type": None} for s in services
-        }
+_MAX_LOG_BUFFER = 200  # keep last N log entries for the dashboard
 
 
 @dataclass
@@ -116,9 +105,11 @@ class Pipeline:
         # Simulator
         self._metrics_gen = MetricsGenerator(config["simulator"])
         self._metrics_iter = self._metrics_gen.generate()
-        self._log_shim = _LogGeneratorShim(services)
+        self._log_gen = LogGenerator(config["simulator"], {
+            s: {"healthy": True, "fault_type": None} for s in services
+        })
         self._fault_injector = FaultInjector(
-            config["simulator"], self._log_shim, self._metrics_gen,  # type: ignore[arg-type]
+            config["simulator"], self._log_gen, self._metrics_gen,  # type: ignore[arg-type]
         )
 
         # Detection
@@ -162,6 +153,12 @@ class Pipeline:
         self._running = True
         logger.info("LogSentry starting — warm-up phase")
         self._warm_up()
+        # Clear metric history accumulated during warm-up — those snapshots share
+        # the same timestamp (generated in a tight loop) and would compress the
+        # chart x-axis into a useless vertical sliver.
+        for s in self._services:
+            self._dash["metric_history"][s] = []
+        self._dash["anomaly_events"] = []
         logger.info("Warm-up complete. Entering detection loop (Ctrl+C to stop)")
 
         while self._running:
@@ -224,6 +221,19 @@ class Pipeline:
         """One simulation tick: generate metrics → detect → agent if anomaly."""
         # Advance fault injector (expires timed-out faults)
         self._fault_injector.tick()
+
+        # Generate logs for this tick and feed into dashboard buffer
+        log_entries = self._log_gen.generate_tick()
+        for entry in log_entries:
+            self._dash["log_buffer"].append({
+                "timestamp": entry.timestamp.isoformat(),
+                "service":   entry.service,
+                "level":     entry.level,
+                "message":   entry.message,
+            })
+        # Cap the log buffer
+        if len(self._dash["log_buffer"]) > _MAX_LOG_BUFFER:
+            self._dash["log_buffer"] = self._dash["log_buffer"][-_MAX_LOG_BUFFER:]
 
         # Generate one snapshot per service
         for _ in range(len(self._services)):
@@ -295,7 +305,10 @@ class Pipeline:
             anomaly_score=ensemble_score,
             triggered_metrics=stat_result.triggered_metrics,
             feature_vector=fv,
-            recent_logs=[],  # LogGenerator not yet implemented
+            recent_logs=[
+                e for e in self._dash["log_buffer"][-20:]
+                if e.get("service") == service
+            ],
             metric_snapshot=snapshot.to_dict(),
         )
 
@@ -350,6 +363,7 @@ class Pipeline:
         _STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         tmp = _STATE_FILE.with_suffix(".tmp")
         try:
+            self._dash["last_updated"] = datetime.now(timezone.utc).isoformat()
             with open(tmp, "w") as f:
                 json.dump(self._dash, f, default=str)
             tmp.replace(_STATE_FILE)

@@ -13,6 +13,7 @@ Run with:
 from __future__ import annotations
 
 import json
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -70,6 +71,7 @@ class DashboardState:
     remediation_log: list[dict[str, Any]] = field(default_factory=list)
     service_status: dict[str, str] = field(default_factory=dict)
     pipeline_started_at: datetime | None = None
+    last_updated: datetime | None = None
 
 
 # ── Public render functions ───────────────────────────────────────────────────
@@ -91,6 +93,13 @@ def _load_state_from_file() -> DashboardState:
         )
         if data.get("pipeline_started_at"):
             state.pipeline_started_at = datetime.fromisoformat(data["pipeline_started_at"])
+        if data.get("last_updated"):
+            state.last_updated = datetime.fromisoformat(data["last_updated"])
+        else:
+            # Fall back to the file's OS modification time so staleness detection
+            # works even for pipelines that don't write last_updated yet.
+            mtime = os.path.getmtime(_STATE_FILE)
+            state.last_updated = datetime.fromtimestamp(mtime, tz=timezone.utc)
         return state
     except Exception:
         return DashboardState()
@@ -164,12 +173,31 @@ def render_header() -> None:
     if _state is None or _state.pipeline_started_at is None:
         st.markdown(":orange[**Pipeline: Waiting**]")
     else:
-        uptime = datetime.now(timezone.utc) - _state.pipeline_started_at
+        started = _state.pipeline_started_at
+        # pipeline_started_at may be tz-aware or tz-naive depending on source
+        now_utc = datetime.now(timezone.utc)
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        uptime = now_utc - started
         hours, rem = divmod(int(uptime.total_seconds()), 3600)
         mins, secs = divmod(rem, 60)
+
+        # Show how stale the data is — red if pipeline has stopped writing
+        if _state.last_updated is not None:
+            lu = _state.last_updated
+            if lu.tzinfo is None:
+                lu = lu.replace(tzinfo=timezone.utc)
+            age = (now_utc - lu).total_seconds()
+            freshness = (
+                f":green[live — {age:.0f}s ago]" if age < 15
+                else f":red[STALE — last update {age:.0f}s ago — is the pipeline running?]"
+            )
+        else:
+            freshness = ":orange[unknown]"
+
         st.markdown(
             f":green[**Pipeline: Running**] — uptime: "
-            f"{hours:02d}:{mins:02d}:{secs:02d}"
+            f"{hours:02d}:{mins:02d}:{secs:02d} | Data: {freshness}"
         )
 
 
@@ -201,10 +229,21 @@ def render_service_health(state: DashboardState) -> None:
                 st.markdown(f"**{badge} {service}**")
                 st.caption(status.upper())
                 if latest:
-                    st.metric("CPU", f"{latest.get('cpu_percent', 0):.1f}%")
-                    st.metric("Memory", f"{latest.get('memory_mb', 0):.0f} MB")
-                    st.metric("Latency", f"{latest.get('latency_ms', 0):.1f} ms")
-                    st.metric("Errors/s", f"{latest.get('error_rate', 0):.3f}")
+                    prev = history[-2] if len(history) >= 2 else {}
+                    cpu = latest.get("cpu_percent", 0)
+                    mem = latest.get("memory_mb", 0)
+                    lat = latest.get("latency_ms", 0)
+                    err = latest.get("error_rate", 0)
+                    st.metric("CPU", f"{cpu:.1f}%",
+                              delta=f"{cpu - prev.get('cpu_percent', cpu):.1f}%" if prev else None)
+                    st.metric("Memory", f"{mem:.0f} MB",
+                              delta=f"{mem - prev.get('memory_mb', mem):.0f} MB" if prev else None)
+                    st.metric("Latency", f"{lat:.1f} ms",
+                              delta=f"{lat - prev.get('latency_ms', lat):.1f} ms" if prev else None,
+                              delta_color="inverse")
+                    st.metric("Errors/s", f"{err:.3f}",
+                              delta=f"{err - prev.get('error_rate', err):.3f}" if prev else None,
+                              delta_color="inverse")
                 else:
                     st.caption("No snapshots yet")
 
@@ -259,15 +298,21 @@ def render_metrics_charts(state: DashboardState) -> None:
                         col=1,
                     )
 
-            # Overlay anomaly markers on every subplot row.
-            service_anomalies = [
-                a for a in state.anomaly_events if a.get("service") == service
-            ]
+            # Overlay anomaly markers — only within the chart's time range.
+            # Use tz-naive comparisons throughout to avoid pandas tz mismatch.
+            t_min = df["timestamp"].min()
+            t_max = df["timestamp"].max()
+            service_anomalies = []
+            for a in state.anomaly_events:
+                if a.get("service") != service or not a.get("detected_at"):
+                    continue
+                at = pd.to_datetime(a["detected_at"]).replace(tzinfo=None)
+                if t_min <= at <= t_max:
+                    service_anomalies.append(a)
             if service_anomalies:
                 anomaly_times = [a.get("detected_at") for a in service_anomalies]
                 anomaly_scores = [a.get("anomaly_score", 0.0) for a in service_anomalies]
                 for row in range(1, n_rows + 1):
-                    # Use anomaly_score as y-value only on the last row for the overlay.
                     y_vals = anomaly_scores if row == n_rows else [None] * len(anomaly_times)
                     fig.add_trace(
                         go.Scatter(
@@ -282,8 +327,11 @@ def render_metrics_charts(state: DashboardState) -> None:
                         col=1,
                     )
 
-            fig.update_layout(height=700, showlegend=True, margin=dict(t=30, b=0))
-            st.plotly_chart(fig, use_container_width=True)
+            fig.update_layout(
+                height=700, showlegend=True, margin=dict(t=30, b=0),
+                xaxis=dict(type="date"),
+            )
+            st.plotly_chart(fig, width="stretch")
 
 
 def render_log_stream(state: DashboardState) -> None:
@@ -318,7 +366,7 @@ def render_log_stream(state: DashboardState) -> None:
         return [style] * len(row)
 
     styled = df.style.apply(_color_rows, axis=1)
-    st.dataframe(styled, use_container_width=True, height=300)
+    st.dataframe(styled, width="stretch", height=300)
 
 
 def render_anomaly_alerts(state: DashboardState) -> None:
@@ -433,22 +481,26 @@ def render_remediation_log(state: DashboardState) -> None:
         })
 
     df = pd.DataFrame(rows)
-    st.dataframe(df, use_container_width=True)
+    st.dataframe(df, width="stretch")
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _status_badge(status: str) -> str:
     """
-    Return a coloured emoji badge for a service status string.
+    Return a coloured Streamlit markdown badge for a service status string.
 
     Args:
         status: One of 'healthy', 'degraded', 'down'.
 
     Returns:
-        Emoji string: green circle, yellow circle, or red circle.
+        Streamlit colour-coded markdown string.
     """
-    return {"healthy": "🟢", "degraded": "🟡", "down": "🔴"}.get(status, "⚪")
+    return {
+        "healthy":  ":green[HEALTHY]",
+        "degraded": ":orange[DEGRADED]",
+        "down":     ":red[DOWN]",
+    }.get(status, ":gray[UNKNOWN]")
 
 
 def _cap_history(
