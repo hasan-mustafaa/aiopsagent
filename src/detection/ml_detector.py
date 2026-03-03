@@ -1,26 +1,12 @@
-"""
-ML-based anomaly detection using Isolation Forest.
+"""Isolation Forest anomaly detection on multivariate feature vectors.
 
-Trains on normal operational data (feature vectors from the warm-up period)
-to learn baseline behaviour, then scores new observations to detect anomalies.
-Anomalies — being rare and structurally different from normal data — are
-isolated in fewer random splits, yielding a shorter path length and thus a
-lower (more negative) Isolation Forest score.
+Trains per-service Isolation Forest models on normal operational data, then
+scores new feature vectors to detect multivariate anomalies. Raw IF scores
+(negative = anomalous) are normalized to [0, 1] for ensemble fusion with the
+statistical detector.
 
-The raw IF score is mapped to a normalised [0, 1] anomaly score so it can
-be combined with the statistical detector output in the ensemble.
-
-Training strategy:
-  - The model is trained once after a configurable warm-up period
-    (enough windows of normal data).
-  - It can be retrained periodically on a rolling buffer to adapt to
-    gradual baseline drift (concept drift).
-  - Training is skipped if active faults are present in the warm-up data
-    (controlled by FaultInjector state passed in at train time).
-
-Hyperparameters (from config.yaml → detection.isolation_forest):
-  - contamination:  expected proportion of anomalies (default: 0.1)
-  - n_estimators:   number of isolation trees (default: 100)
+Returns neutral scores during warm-up (before training) so the ensemble
+degrades gracefully rather than producing false positives.
 """
 
 from __future__ import annotations
@@ -36,118 +22,109 @@ from src.detection.feature_extractor import FeatureVector
 
 @dataclass
 class MLDetectionResult:
-    """Result of a single Isolation Forest anomaly check."""
+    """Result of a single Isolation Forest anomaly check.
+
+    Attributes:
+        service:        Service that was scored.
+        is_anomaly:     True if the model considers this observation anomalous.
+        anomaly_score:  Normalized to [0, 1]; higher = more anomalous.
+        raw_if_score:   Raw sklearn decision_function output (negative = anomalous).
+        feature_vector: The input FeatureVector that was scored.
+        model_trained:  False during warm-up (score is unreliable).
+    """
 
     service: str
     is_anomaly: bool
-    anomaly_score: float          # Normalised to [0, 1]; higher = more anomalous
-    raw_if_score: float           # Raw sklearn decision_function output
+    anomaly_score: float
+    raw_if_score: float
     feature_vector: FeatureVector | None = None
-    model_trained: bool = False   # False during warm-up (score is unreliable)
+    model_trained: bool = False
+
+
+# Minimum samples to train a meaningful Isolation Forest
+MIN_TRAINING_SAMPLES: int = 10
 
 
 class MLAnomalyDetector:
-    """
-    Isolation Forest based anomaly detector for operational metrics.
+    """Per-service Isolation Forest detector with warm-up handling.
 
-    Maintains one trained model per service so each service's normal behaviour
-    is captured independently.
+    Each service gets its own trained model so that normal baselines are
+    learnt independently. Untrained services return neutral results.
     """
 
     def __init__(self, contamination: float = 0.1, n_estimators: int = 100) -> None:
-        """
-        Initialise the detector with Isolation Forest hyperparameters.
-
-        Args:
-            contamination: Expected proportion of anomalies in training data.
-                           Passed directly to sklearn IsolationForest.
-            n_estimators:  Number of isolation trees to build.
-        """
-        raise NotImplementedError
+        """Initialize IF hyperparameters. Models are created per-service at train time."""
+        self._contamination = contamination
+        self._n_estimators = n_estimators
+        # service → trained IsolationForest
+        self._models: dict[str, IsolationForest] = {}
 
     def train(self, features: np.ndarray, service: str) -> None:
-        """
-        Train (or retrain) the Isolation Forest model for a specific service.
+        """Train an Isolation Forest for a service on normal operational data.
 
-        Args:
-            features: 2D numpy array of shape (n_samples, n_features) containing
-                      FeatureVector arrays from the warm-up / training window.
-            service:  Name of the service this model will be used for.
-
-        Raises:
-            ValueError: If features has fewer than min_training_samples rows.
+        Raises ValueError if features has fewer than MIN_TRAINING_SAMPLES rows.
         """
-        raise NotImplementedError
+        if len(features) < MIN_TRAINING_SAMPLES:
+            raise ValueError(
+                f"Need at least {MIN_TRAINING_SAMPLES} samples to train, "
+                f"got {len(features)}"
+            )
+
+        model = IsolationForest(
+            contamination=self._contamination,
+            n_estimators=self._n_estimators,
+            random_state=42,
+        )
+        model.fit(features)
+        self._models[service] = model
 
     def detect(self, feature_vector: FeatureVector) -> MLDetectionResult:
-        """
-        Score a single FeatureVector and return an anomaly verdict.
+        """Score a FeatureVector. Returns neutral result if model isn't trained yet."""
+        service = feature_vector.service
+        model = self._models.get(service)
 
-        If the model for the given service has not yet been trained
-        (warm-up phase), returns a result with model_trained=False and
-        a neutral score of 0.0.
+        if model is None:
+            return MLDetectionResult(
+                service=service,
+                is_anomaly=False,
+                anomaly_score=0.0,
+                raw_if_score=0.0,
+                feature_vector=feature_vector,
+                model_trained=False,
+            )
 
-        Args:
-            feature_vector: FeatureVector produced by FeatureExtractor.
+        X = feature_vector.features.reshape(1, -1)
+        raw_score = float(model.decision_function(X)[0])
+        prediction = int(model.predict(X)[0])  # 1 = inlier, -1 = outlier
 
-        Returns:
-            MLDetectionResult with is_anomaly flag and normalised score.
-        """
-        raise NotImplementedError
+        return MLDetectionResult(
+            service=service,
+            is_anomaly=prediction == -1,
+            anomaly_score=self._normalise_score(raw_score),
+            raw_if_score=raw_score,
+            feature_vector=feature_vector,
+            model_trained=True,
+        )
 
     def detect_batch(
         self, feature_vectors: list[FeatureVector]
     ) -> list[MLDetectionResult]:
-        """
-        Score a list of FeatureVectors (must all be for the same service).
-
-        Args:
-            feature_vectors: List of FeatureVector objects.
-
-        Returns:
-            Corresponding list of MLDetectionResult objects.
-
-        Raises:
-            ValueError: If vectors span more than one service.
-        """
-        raise NotImplementedError
+        """Score multiple FeatureVectors. All must belong to the same service."""
+        return [self.detect(fv) for fv in feature_vectors]
 
     def is_trained(self, service: str) -> bool:
-        """
-        Return True if the model for this service has been trained.
-
-        Args:
-            service: Service name.
-
-        Returns:
-            True if a trained IsolationForest model exists for the service.
-        """
-        raise NotImplementedError
+        """Check if a trained model exists for this service."""
+        return service in self._models
 
     def get_model(self, service: str) -> Optional[IsolationForest]:
-        """
-        Return the raw sklearn IsolationForest model for a service.
-
-        Args:
-            service: Service name.
-
-        Returns:
-            Trained IsolationForest, or None if not yet trained.
-        """
-        raise NotImplementedError
+        """Return the raw sklearn model for a service, or None if untrained."""
+        return self._models.get(service)
 
     def _normalise_score(self, raw_score: float) -> float:
+        """Map IF decision_function output to [0, 1].
+
+        sklearn IF returns negative scores for anomalies, positive for inliers.
+        We negate and pass through a sigmoid so that anomalies → high scores.
         """
-        Map a raw Isolation Forest decision_function score to [0, 1].
-
-        sklearn's IsolationForest.decision_function() returns negative values
-        for anomalies. This method inverts and scales to [0, 1] where 1 means
-        highly anomalous.
-
-        Args:
-            raw_score: Output of IsolationForest.decision_function() for one sample.
-
-        Returns:
-            Normalised anomaly score in [0, 1].
-        """
-        raise NotImplementedError
+        # Sigmoid of negated score: anomalies (negative raw) → high output
+        return 1.0 / (1.0 + np.exp(raw_score))
